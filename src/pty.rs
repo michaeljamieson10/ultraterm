@@ -94,6 +94,7 @@ pub fn spawn_pty(config: &SpawnConfig) -> Result<(PtyHandle, Receiver<Vec<u8>>)>
     if config.truecolor {
         cmd.env("COLORTERM", "truecolor");
     }
+    cmd.env("PROMPT_EOL_MARK", "");
 
     if let Ok(home) = env::var("HOME") {
         cmd.cwd(home);

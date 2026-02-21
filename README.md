@@ -48,6 +48,10 @@ No special system permission prompts are required for basic operation.
 
 - `Cmd+Shift+P`: toggle profiling overlay (FPS, frame ms, dirty rows, PTY KB/s)
 - `Cmd+Shift+S`: run stress command (`yes ...`) inside current shell
+- `Cmd+=` / `Cmd++`: increase font size
+- `Cmd+-`: decrease font size
+- In fullscreen, macOS handles title-bar reveal at the top edge; in windowed mode the title bar stays visible
+- The title bar is transparent so its background matches terminal content
 - Mouse drag: text selection (when terminal mouse reporting is disabled)
 - `Cmd+C`: copy current selection (falls back to sending `Ctrl-C` if no selection)
 - `Cmd+V`: paste clipboard text (uses bracketed paste when enabled by app)

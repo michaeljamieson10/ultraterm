@@ -11,7 +11,13 @@ use crate::screen::{CellFlags, CursorShape, Rgb, Screen, CURSOR_COLOR, DEFAULT_B
 
 const ATLAS_WIDTH: u32 = 2048;
 const ATLAS_HEIGHT: u32 = 2048;
-const FONT_SIZE: f32 = 18.0;
+const GRID_LEFT_PADDING: f32 = 2.0;
+const GRID_TOP_OFFSET_WINDOWED: f32 = 26.0;
+const GRID_TOP_OFFSET_FULLSCREEN: f32 = -2.0;
+const DEFAULT_FONT_SIZE: f32 = 20.0;
+const FONT_SIZE_STEP: f32 = 1.0;
+const MIN_FONT_SIZE: f32 = 8.0;
+const MAX_FONT_SIZE: f32 = 64.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SelectionRange {
@@ -247,6 +253,8 @@ pub struct Renderer {
     quad_index_count: u32,
     atlas: GlyphAtlas,
     font: Font,
+    font_size: f32,
+    grid_top_offset: f32,
     pub cell_width: f32,
     pub cell_height: f32,
     baseline: f32,
@@ -315,9 +323,9 @@ impl Renderer {
 
         let font = load_font()?;
         let line_metrics = font
-            .horizontal_line_metrics(FONT_SIZE)
+            .horizontal_line_metrics(DEFAULT_FONT_SIZE)
             .ok_or_else(|| anyhow!("missing line metrics for loaded font"))?;
-        let mono_metrics = font.metrics('W', FONT_SIZE);
+        let mono_metrics = font.metrics('W', DEFAULT_FONT_SIZE);
         let cell_width = mono_metrics.advance_width.max(1.0).ceil();
         let cell_height = line_metrics.new_line_size.max(1.0).ceil();
         let baseline = line_metrics.ascent.ceil();
@@ -527,6 +535,12 @@ impl Renderer {
             quad_index_count: quad_indices.len() as u32,
             atlas,
             font,
+            font_size: DEFAULT_FONT_SIZE,
+            grid_top_offset: if window.fullscreen().is_some() {
+                GRID_TOP_OFFSET_FULLSCREEN
+            } else {
+                GRID_TOP_OFFSET_WINDOWED
+            },
             cell_width,
             cell_height,
             baseline,
@@ -543,9 +557,59 @@ impl Renderer {
     }
 
     pub fn grid_from_window_size(&self, size: PhysicalSize<u32>) -> (usize, usize) {
-        let cols = (size.width as f32 / self.cell_width).floor().max(1.0) as usize;
-        let rows = (size.height as f32 / self.cell_height).floor().max(1.0) as usize;
+        let available_width = (size.width as f32 - GRID_LEFT_PADDING).max(1.0);
+        let available_height = (size.height as f32 - self.grid_top_offset.max(0.0)).max(1.0);
+        let cols = (available_width / self.cell_width).floor().max(1.0) as usize;
+        let rows = (available_height / self.cell_height).floor().max(1.0) as usize;
         (cols, rows)
+    }
+
+    pub fn grid_left_padding(&self) -> f32 {
+        GRID_LEFT_PADDING
+    }
+
+    pub fn grid_top_offset(&self) -> f32 {
+        self.grid_top_offset
+    }
+
+    pub fn set_fullscreen_layout(&mut self, fullscreen: bool) -> bool {
+        let next = if fullscreen {
+            GRID_TOP_OFFSET_FULLSCREEN
+        } else {
+            GRID_TOP_OFFSET_WINDOWED
+        };
+        if (next - self.grid_top_offset).abs() < f32::EPSILON {
+            return false;
+        }
+        self.grid_top_offset = next;
+        true
+    }
+
+    pub fn increase_font_size(&mut self) -> bool {
+        self.set_font_size(self.font_size + FONT_SIZE_STEP)
+    }
+
+    pub fn decrease_font_size(&mut self) -> bool {
+        self.set_font_size(self.font_size - FONT_SIZE_STEP)
+    }
+
+    fn set_font_size(&mut self, font_size: f32) -> bool {
+        let next = font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        if (next - self.font_size).abs() < f32::EPSILON {
+            return false;
+        }
+
+        let Some(line_metrics) = self.font.horizontal_line_metrics(next) else {
+            return false;
+        };
+        let mono_metrics = self.font.metrics('W', next);
+
+        self.font_size = next;
+        self.cell_width = mono_metrics.advance_width.max(1.0).ceil();
+        self.cell_height = line_metrics.new_line_size.max(1.0).ceil();
+        self.baseline = line_metrics.ascent.ceil();
+        self.atlas.clear(&self.queue);
+        true
     }
 
     pub fn resize_surface(&mut self, size: PhysicalSize<u32>, rows: usize) {
@@ -626,8 +690,8 @@ impl Renderer {
             let mut instances = Vec::with_capacity(cols * 2 + 4);
 
             for (col, cell) in line.iter().enumerate() {
-                let x = col as f32 * self.cell_width;
-                let y = row as f32 * self.cell_height;
+                let x = GRID_LEFT_PADDING + col as f32 * self.cell_width;
+                let y = self.grid_top_offset + row as f32 * self.cell_height;
 
                 if cell.bg != DEFAULT_BG {
                     instances.push(Instance {
@@ -649,14 +713,20 @@ impl Renderer {
             }
 
             if cursor.visible && cursor.row == row {
-                let cursor_x = cursor.col as f32 * self.cell_width;
+                let cursor_x = GRID_LEFT_PADDING + cursor.col as f32 * self.cell_width;
                 let (pos, size) = match cursor.shape {
                     CursorShape::Block => (
-                        [cursor_x, row as f32 * self.cell_height],
+                        [
+                            cursor_x,
+                            self.grid_top_offset + row as f32 * self.cell_height,
+                        ],
                         [self.cell_width, self.cell_height],
                     ),
                     CursorShape::Beam => (
-                        [cursor_x, row as f32 * self.cell_height],
+                        [
+                            cursor_x,
+                            self.grid_top_offset + row as f32 * self.cell_height,
+                        ],
                         [(self.cell_width * 0.12).max(2.0), self.cell_height],
                     ),
                     CursorShape::Underline => {
@@ -664,7 +734,9 @@ impl Renderer {
                         (
                             [
                                 cursor_x,
-                                row as f32 * self.cell_height + (self.cell_height - h),
+                                self.grid_top_offset
+                                    + row as f32 * self.cell_height
+                                    + (self.cell_height - h),
                             ],
                             [self.cell_width, h],
                         )
@@ -703,7 +775,7 @@ impl Renderer {
         };
         let glyph = self
             .atlas
-            .get_or_insert(&self.font, FONT_SIZE, &self.queue, key);
+            .get_or_insert(&self.font, self.font_size, &self.queue, key);
 
         if glyph.width == 0 || glyph.height == 0 {
             return None;
@@ -836,7 +908,10 @@ impl Renderer {
                 continue;
             }
             out.push(Instance {
-                pos: [from as f32 * self.cell_width, row as f32 * self.cell_height],
+                pos: [
+                    GRID_LEFT_PADDING + from as f32 * self.cell_width,
+                    self.grid_top_offset + row as f32 * self.cell_height,
+                ],
                 size: [(to - from + 1) as f32 * self.cell_width, self.cell_height],
                 uv_min: white_min,
                 uv_max: white_max,

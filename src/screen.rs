@@ -184,9 +184,9 @@ impl Buffer {
         &self.cells[start..start + self.cols]
     }
 
-    fn clear_physical_row(&mut self, physical_row: usize) {
+    fn clear_physical_row(&mut self, physical_row: usize, cell: Cell) {
         let start = physical_row * self.cols;
-        self.cells[start..start + self.cols].fill(Cell::blank());
+        self.cells[start..start + self.cols].fill(cell);
     }
 
     fn rotate_up(&mut self, top: usize, bottom: usize) -> usize {
@@ -512,6 +512,7 @@ impl Screen {
         let count = n.max(1).min(bottom.saturating_sub(top) + 1);
         let push_to_scrollback =
             !self.use_alternate && top == 0 && bottom == self.rows.saturating_sub(1);
+        let erase_cell = self.erase_cell();
 
         for _ in 0..count {
             let (removed_phys, removed_line) = {
@@ -522,7 +523,7 @@ impl Screen {
                 } else {
                     None
                 };
-                active.clear_physical_row(phys);
+                active.clear_physical_row(phys, erase_cell);
                 (phys, line)
             };
 
@@ -539,9 +540,10 @@ impl Screen {
 
     pub fn scroll_down(&mut self, n: usize, top: usize, bottom: usize) {
         let count = n.max(1).min(bottom.saturating_sub(top) + 1);
+        let erase_cell = self.erase_cell();
         for _ in 0..count {
             let inserted = self.active_mut().rotate_down(top, bottom);
-            self.active_mut().clear_physical_row(inserted);
+            self.active_mut().clear_physical_row(inserted, erase_cell);
         }
         for row in top..=bottom {
             self.mark_dirty(row);
@@ -553,25 +555,26 @@ impl Screen {
             let cursor = self.active().cursor;
             (cursor.row, cursor.col)
         };
+        let erase_cell = self.erase_cell();
 
         match mode {
             0 => {
                 self.erase_in_line(0);
                 for row in cursor_row + 1..self.rows {
-                    self.active_mut().line_mut(row).fill(Cell::blank());
+                    self.active_mut().line_mut(row).fill(erase_cell);
                     self.mark_dirty(row);
                 }
             }
             1 => {
                 self.erase_in_line(1);
                 for row in 0..cursor_row {
-                    self.active_mut().line_mut(row).fill(Cell::blank());
+                    self.active_mut().line_mut(row).fill(erase_cell);
                     self.mark_dirty(row);
                 }
             }
             2 | 3 => {
                 for row in 0..self.rows {
-                    self.active_mut().line_mut(row).fill(Cell::blank());
+                    self.active_mut().line_mut(row).fill(erase_cell);
                     self.mark_dirty(row);
                 }
             }
@@ -586,11 +589,12 @@ impl Screen {
             let cursor = self.active().cursor;
             (cursor.row, cursor.col)
         };
+        let erase_cell = self.erase_cell();
         let line = self.active_mut().line_mut(row);
         match mode {
-            0 => line[col..].fill(Cell::blank()),
-            1 => line[..=col].fill(Cell::blank()),
-            2 => line.fill(Cell::blank()),
+            0 => line[col..].fill(erase_cell),
+            1 => line[..=col].fill(erase_cell),
+            2 => line.fill(erase_cell),
             _ => {}
         }
         self.mark_dirty(row);
@@ -607,9 +611,10 @@ impl Screen {
         }
 
         let count = n.max(1).min(bottom - row + 1);
+        let erase_cell = self.erase_cell();
         for _ in 0..count {
             let inserted = self.active_mut().rotate_down(row, bottom);
-            self.active_mut().clear_physical_row(inserted);
+            self.active_mut().clear_physical_row(inserted, erase_cell);
         }
         for r in row..=bottom {
             self.mark_dirty(r);
@@ -627,9 +632,10 @@ impl Screen {
         }
 
         let count = n.max(1).min(bottom - row + 1);
+        let erase_cell = self.erase_cell();
         for _ in 0..count {
             let removed = self.active_mut().rotate_up(row, bottom);
-            self.active_mut().clear_physical_row(removed);
+            self.active_mut().clear_physical_row(removed, erase_cell);
         }
         for r in row..=bottom {
             self.mark_dirty(r);
@@ -643,11 +649,12 @@ impl Screen {
         };
         let cols = self.cols;
         let count = n.max(1).min(cols - col);
+        let erase_cell = self.erase_cell();
         let line = self.active_mut().line_mut(row);
         for idx in (col..cols - count).rev() {
             line[idx + count] = line[idx];
         }
-        line[col..col + count].fill(Cell::blank());
+        line[col..col + count].fill(erase_cell);
         self.mark_dirty(row);
     }
 
@@ -658,11 +665,12 @@ impl Screen {
         };
         let cols = self.cols;
         let count = n.max(1).min(cols - col);
+        let erase_cell = self.erase_cell();
         let line = self.active_mut().line_mut(row);
         for idx in col..cols - count {
             line[idx] = line[idx + count];
         }
-        line[cols - count..].fill(Cell::blank());
+        line[cols - count..].fill(erase_cell);
         self.mark_dirty(row);
     }
 
@@ -672,7 +680,8 @@ impl Screen {
             (a.cursor.row, a.cursor.col)
         };
         let count = n.max(1).min(self.cols - col);
-        self.active_mut().line_mut(row)[col..col + count].fill(Cell::blank());
+        let erase_cell = self.erase_cell();
+        self.active_mut().line_mut(row)[col..col + count].fill(erase_cell);
         self.mark_dirty(row);
     }
 
@@ -703,6 +712,13 @@ impl Screen {
             bg,
             flags,
         }
+    }
+
+    fn erase_cell(&self) -> Cell {
+        let mut cell = self.current_cell_template();
+        cell.ch = ' ';
+        cell.flags.remove(CellFlags::WIDE | CellFlags::WIDE_CONT);
+        cell
     }
 
     pub fn put_char(&mut self, ch: char) {
@@ -888,5 +904,25 @@ pub fn basic_ansi_to_rgb(code: u16, bright: bool) -> Rgb {
         (6, true) => Rgb::new(41, 184, 219),
         (7, true) => Rgb::new(255, 255, 255),
         _ => DEFAULT_FG,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Rgb, Screen};
+
+    #[test]
+    fn erase_in_display_respects_current_background_color() {
+        let mut screen = Screen::new(4, 2, 16);
+        let theme_bg = Rgb::new(88, 88, 140);
+        screen.set_bg(theme_bg);
+        screen.erase_in_display(2);
+
+        for row in 0..screen.rows() {
+            for cell in screen.line(row) {
+                assert_eq!(cell.bg, theme_bg);
+                assert_eq!(cell.ch, ' ');
+            }
+        }
     }
 }

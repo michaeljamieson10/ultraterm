@@ -8,6 +8,8 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState};
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowBuilderExtMacOS;
 use winit::window::WindowBuilder;
 
 use crate::input;
@@ -122,6 +124,11 @@ pub fn run() -> Result<()> {
             .with_title("ultraterm")
             .with_inner_size(PhysicalSize::new(1280_u32, 800_u32))
             .with_resizable(true)
+            .with_transparent(true)
+            .with_titlebar_transparent(true)
+            .with_fullsize_content_view(true)
+            .with_title_hidden(true)
+            .with_movable_by_window_background(true)
             .build(&event_loop)
             .context("failed to create window")?,
     );
@@ -130,6 +137,7 @@ pub fn run() -> Result<()> {
 
     let mut renderer =
         pollster::block_on(Renderer::new(window, 64)).context("failed to initialize renderer")?;
+    renderer.set_fullscreen_layout(effective_fullscreen(window));
 
     let (initial_cols, initial_rows) = renderer.grid_from_window_size(window.inner_size());
     let mut screen = Screen::new(initial_cols, initial_rows, SCROLLBACK_LINES);
@@ -186,6 +194,17 @@ pub fn run() -> Result<()> {
                             modifiers = new_modifiers.state();
                         }
                         WindowEvent::KeyboardInput { event, .. } => {
+                            if handle_font_size_shortcuts(
+                                &event,
+                                modifiers,
+                                &mut renderer,
+                                &mut screen,
+                                &pty,
+                                &window,
+                            ) {
+                                return;
+                            }
+
                             if handle_shortcuts(
                                 &event,
                                 modifiers,
@@ -235,6 +254,8 @@ pub fn run() -> Result<()> {
                                 position,
                                 renderer.cell_width,
                                 renderer.cell_height,
+                                renderer.grid_left_padding(),
+                                renderer.grid_top_offset(),
                                 screen.cols(),
                                 screen.rows(),
                             );
@@ -374,6 +395,8 @@ pub fn run() -> Result<()> {
                     }
                 }
                 Event::AboutToWait => {
+                    sync_layout_mode(&mut renderer, &mut screen, &pty, &window);
+
                     let had_pty = drain_pty(&mut parser, &mut screen, &pty_rx, &mut pty, &mut perf);
                     if had_pty {
                         window.request_redraw();
@@ -412,6 +435,7 @@ fn apply_resize(
     size: PhysicalSize<u32>,
     window: &winit::window::Window,
 ) {
+    let top_offset_changed = renderer.set_fullscreen_layout(effective_fullscreen(window));
     let (cols, rows) = renderer.grid_from_window_size(size);
     let changed = cols != screen.cols() || rows != screen.rows();
 
@@ -422,9 +446,135 @@ fn apply_resize(
         if let Err(err) = pty.resize(cols, rows) {
             warn!("failed to resize PTY: {err}");
         }
+    } else if top_offset_changed {
+        screen.mark_all_dirty();
+        renderer.mark_all_dirty(screen);
     }
 
     window.request_redraw();
+}
+
+fn sync_layout_mode(
+    renderer: &mut Renderer,
+    screen: &mut Screen,
+    pty: &PtyHandle,
+    window: &winit::window::Window,
+) {
+    let size = window.inner_size();
+    if size.width == 0 || size.height == 0 {
+        return;
+    }
+
+    let top_offset_changed = renderer.set_fullscreen_layout(effective_fullscreen(window));
+    if !top_offset_changed {
+        return;
+    }
+
+    let (cols, rows) = renderer.grid_from_window_size(size);
+    let grid_changed = cols != screen.cols() || rows != screen.rows();
+    renderer.resize_surface(size, rows);
+
+    if grid_changed {
+        screen.resize(cols, rows);
+        if let Err(err) = pty.resize(cols, rows) {
+            warn!("failed to resize PTY after mode change: {err}");
+        }
+    }
+
+    screen.mark_all_dirty();
+    renderer.mark_all_dirty(screen);
+    window.request_redraw();
+}
+
+fn effective_fullscreen(window: &winit::window::Window) -> bool {
+    if window.fullscreen().is_none() {
+        return false;
+    }
+
+    let Some(monitor) = window.current_monitor() else {
+        return true;
+    };
+
+    let window_size = window.inner_size();
+    let monitor_size = monitor.size();
+    if monitor_size.width == 0 || monitor_size.height == 0 {
+        return true;
+    }
+
+    let width_ratio = window_size.width as f32 / monitor_size.width as f32;
+    let height_ratio = window_size.height as f32 / monitor_size.height as f32;
+    width_ratio >= 0.95 && height_ratio >= 0.95
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FontSizeAction {
+    Increase,
+    Decrease,
+}
+
+fn handle_font_size_shortcuts(
+    event: &winit::event::KeyEvent,
+    modifiers: ModifiersState,
+    renderer: &mut Renderer,
+    screen: &mut Screen,
+    pty: &PtyHandle,
+    window: &winit::window::Window,
+) -> bool {
+    let Some(action) = font_size_shortcut_action(event, modifiers) else {
+        return false;
+    };
+
+    let changed = match action {
+        FontSizeAction::Increase => renderer.increase_font_size(),
+        FontSizeAction::Decrease => renderer.decrease_font_size(),
+    };
+    if !changed {
+        return true;
+    }
+
+    let size = window.inner_size();
+    let (cols, rows) = renderer.grid_from_window_size(size);
+    renderer.resize_surface(size, rows);
+
+    let changed = cols != screen.cols() || rows != screen.rows();
+    if changed {
+        screen.resize(cols, rows);
+        if let Err(err) = pty.resize(cols, rows) {
+            warn!("failed to resize PTY after font size change: {err}");
+        }
+    }
+
+    screen.mark_all_dirty();
+    renderer.mark_all_dirty(screen);
+    window.request_redraw();
+    true
+}
+
+fn font_size_shortcut_action(
+    event: &winit::event::KeyEvent,
+    modifiers: ModifiersState,
+) -> Option<FontSizeAction> {
+    let Key::Character(chars) = &event.logical_key else {
+        return None;
+    };
+
+    font_size_action_from_chars(chars.as_str(), event.state, modifiers)
+}
+
+fn font_size_action_from_chars(
+    chars: &str,
+    state: ElementState,
+    modifiers: ModifiersState,
+) -> Option<FontSizeAction> {
+    if state != ElementState::Pressed || !modifiers.super_key() {
+        return None;
+    }
+
+    match chars {
+        "+" | "=" => Some(FontSizeAction::Increase),
+        "-" | "_" => Some(FontSizeAction::Decrease),
+        _ => None,
+    }
 }
 
 fn drain_pty(
@@ -461,11 +611,15 @@ fn cursor_cell_from_position(
     position: PhysicalPosition<f64>,
     cell_width: f32,
     cell_height: f32,
+    grid_left_padding: f32,
+    grid_top_offset: f32,
     cols: usize,
     rows: usize,
 ) -> (usize, usize) {
-    let col = (position.x / cell_width as f64).floor().max(0.0) as usize;
-    let row = (position.y / cell_height as f64).floor().max(0.0) as usize;
+    let adjusted_x = (position.x as f32 - grid_left_padding).max(0.0) as f64;
+    let adjusted_y = (position.y as f32 - grid_top_offset).max(0.0) as f64;
+    let col = (adjusted_x / cell_width as f64).floor().max(0.0) as usize;
+    let row = (adjusted_y / cell_height as f64).floor().max(0.0) as usize;
     (
         col.min(cols.saturating_sub(1)),
         row.min(rows.saturating_sub(1)),
@@ -593,7 +747,7 @@ fn keyboard_text_bytes(
 
 #[cfg(test)]
 mod tests {
-    use super::keyboard_text_bytes;
+    use super::{font_size_action_from_chars, keyboard_text_bytes, FontSizeAction};
     use winit::event::ElementState;
     use winit::keyboard::ModifiersState;
 
@@ -619,5 +773,33 @@ mod tests {
     fn keyboard_text_bytes_rejects_key_release() {
         let out = keyboard_text_bytes(Some("a"), ElementState::Released, ModifiersState::empty());
         assert_eq!(out, None);
+    }
+
+    #[test]
+    fn font_size_shortcuts_match_cmd_plus_equals_minus() {
+        assert_eq!(
+            font_size_action_from_chars("+", ElementState::Pressed, ModifiersState::SUPER),
+            Some(FontSizeAction::Increase),
+        );
+        assert_eq!(
+            font_size_action_from_chars("=", ElementState::Pressed, ModifiersState::SUPER),
+            Some(FontSizeAction::Increase),
+        );
+        assert_eq!(
+            font_size_action_from_chars("-", ElementState::Pressed, ModifiersState::SUPER),
+            Some(FontSizeAction::Decrease),
+        );
+        assert_eq!(
+            font_size_action_from_chars("_", ElementState::Pressed, ModifiersState::SUPER),
+            Some(FontSizeAction::Decrease),
+        );
+        assert_eq!(
+            font_size_action_from_chars("+", ElementState::Pressed, ModifiersState::empty(),),
+            None,
+        );
+        assert_eq!(
+            font_size_action_from_chars("+", ElementState::Released, ModifiersState::SUPER,),
+            None,
+        );
     }
 }
